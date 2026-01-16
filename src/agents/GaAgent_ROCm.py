@@ -360,7 +360,7 @@ class GaAgent(Reflexion_Oneshot):
                 if cand[3]:
                     text += f"\nStrategy: {cand[3]}"
                 if cand[4]:
-                    text += f"\nRocprof-compute profiling result:{cand[4]}"
+                    text += f"\nNsight Compute (ncu) profiling result:{cand[4]}"
             if mutation:
                 text += "\nGenerate a better strategy completely different from Optimized Implementation. Based on the better strategy generate a better optimization code."
             else:    

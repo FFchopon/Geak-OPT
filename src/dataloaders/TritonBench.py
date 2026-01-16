@@ -5,11 +5,25 @@ import subprocess
 from random import randint
 from tqdm import tqdm
 import signal
+import sys
 from multiprocessing import Pool, Lock, Value
 from dataloaders.ProblemState import ProblemState
 from dataloaders.TB_eval.utils import code_call_exec_success_allclose, code_kernel_profiling
 import re
-from tb_eval.evaluators.interface import get_evaluators
+
+# Evaluator package resolution:
+# - If an external `tb_eval` package is installed, use it.
+# - Otherwise, fall back to this repo's GEAK-eval implementation (`GEAK-eval/geak_eval`).
+try:
+    from tb_eval.evaluators.interface import get_evaluators
+except ModuleNotFoundError:
+    _this_dir = os.path.dirname(__file__)
+    _src_root = os.path.abspath(os.path.join(_this_dir, ".."))
+    _repo_root = os.path.abspath(os.path.join(_src_root, ".."))
+    _geak_eval_root = os.path.join(_repo_root, "GEAK-eval")
+    if _geak_eval_root not in sys.path:
+        sys.path.insert(0, _geak_eval_root)
+    from geak_eval.evaluators.interface import get_evaluators
 
 class TritonBench:
     def __init__(self,
@@ -59,7 +73,10 @@ class TritonBench:
                         file = "context_attn_nopad.py"
                 path = os.path.join(self.py_folder, file)
                 assert os.path.exists(path), f"{file} not exist!"
-                test_code = open(path, "r", encoding="utf-8").read().split("#"*146)[-1]
+                full_code = open(path, "r", encoding="utf-8").read()
+                parts = full_code.split("#" * 146)
+                reference_code = parts[0] if len(parts) > 1 else ""
+                test_code = parts[-1]
                 assert "def test_" in  test_code, ""
 
                 problemstate = ProblemState(instruction=instruction,
@@ -67,6 +84,8 @@ class TritonBench:
                                             test_code=test_code, 
                                             filename=file, 
                                             )
+
+                setattr(problemstate, "reference_code", reference_code)
                 
                 problem_states.append(
                     problemstate
@@ -114,13 +133,19 @@ class TritonBench:
 
         return pass_call, pass_exe, speedup, call_stdout, call_stderr
     
-    def test_kernel_profiling(self, code, filename, tmp_dir, save_scripts=True, exe_dir="pass_exe", target_gpu=None, timeout=20*60):
+    def test_kernel_profiling(self, code, filename, tmp_dir, save_scripts=True, exe_dir="pass_exe", target_gpu=None, timeout=20*60, gpu_id=None):
         os.makedirs(exe_dir, exist_ok=True)
-        profile_status, stdout_profile, stderr_profile, stdout_analyze = code_kernel_profiling(code=code, fname=filename, temp_root=tmp_dir, py_folder=self.py_folder, target_gpu=target_gpu, timeout=timeout)
+        profile_status, stdout_profile, stderr_profile, stdout_analyze = code_kernel_profiling(
+            code=code,
+            fname=filename,
+            temp_root=tmp_dir,
+            py_folder=self.py_folder,
+            target_gpu=target_gpu,
+            timeout=timeout,
+            gpu_id=gpu_id,
+        )
         pass_prfiler = False
         if "True" in str(profile_status):
             pass_prfiler=True
         
         return pass_prfiler, stdout_profile, stderr_profile, stdout_analyze
-    
-    

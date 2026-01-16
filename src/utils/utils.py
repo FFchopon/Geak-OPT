@@ -16,7 +16,7 @@ def extract_function_signatures(code):
 
 def clear_code(code):
     if  "```python" in code:
-        code = code.split("```python")[-1].replace("<|im_end|>", "").replace("<|EOT|>", "")
+        code = code.split("```python")[-1].replace("", "").replace("<|EOT|>", "")
     if "```" in code:
         code = code.split("```")[0]
     return code
@@ -32,6 +32,67 @@ def extract_function_calls(code):
         calls.append(f"{func_name}({args})")
     
     return calls
+
+def infer_function_signatures_from_test_code(test_code):
+    if not test_code:
+        return []
+
+    reserved = {
+        "if",
+        "for",
+        "while",
+        "return",
+        "print",
+        "range",
+        "len",
+        "int",
+        "float",
+        "str",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "min",
+        "max",
+        "sum",
+        "abs",
+    }
+
+    blocked_prefixes = ("test_", "torch.", "triton.", "tl.")
+
+    sigs = []
+    seen = set()
+    for call in extract_function_calls(test_code):
+        name = call.split("(", 1)[0].strip()
+        if not name:
+            continue
+        if name in reserved:
+            continue
+        if any(name.startswith(p) for p in blocked_prefixes):
+            continue
+        if "." in name:
+            continue
+        if name in seen:
+            continue
+
+        args_raw = call.split("(", 1)[1].rsplit(")", 1)[0]
+        args = []
+        for a in [x.strip() for x in args_raw.split(",") if x.strip()]:
+            if a.startswith("*"):
+                continue
+            if "=" in a:
+                a = a.split("=", 1)[0].strip()
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", a):
+                continue
+            args.append(a)
+
+        if not args:
+            continue
+
+        sigs.append(f"def {name}({', '.join(args)})")
+        seen.add(name)
+
+    return sigs
 
 def clear_json(response):
     if type(response) is dict:

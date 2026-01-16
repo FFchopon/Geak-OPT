@@ -88,7 +88,7 @@ generate reflection in the \"reflection\" field."""
 
 
 prompt_evolve_reflect = """
-You are an expert Python programmer specializing in writing and optimizing Triton kernels for AMD GPUs using the ROCm environment.
+You are an expert Python programmer specializing in writing and optimizing Triton kernels for NVIDIA GPUs using the CUDA environment.
 You are tasked with iteratively improving a codebase.
 Given the original problem, metrics information, a history of previous implementations with their test results and reflections, previous top implementations with their test results and current implementation with its test error message, your job is to analyze the error messages and provide insights on why the solution failed and how it could be fixed. Be specific about the issues found.
 
@@ -100,7 +100,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 ## Requirements:
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -150,8 +150,9 @@ Based on analysis, the implementation requires these EXACT function signatures:
 
 """
 
+
 prompt_evolve_strategy_optimize = """
-You are an expert Python programmer specializing in writing and optimizing Triton kernels for AMD GPUs using the ROCm environment.
+You are an expert Python programmer specializing in writing and optimizing Triton kernels for NVIDIA GPUs using the CUDA environment.
 You are tasked with iteratively improving a codebase.
 You are given the original problem, metrics information, a history of previous implementations with their test results and reflections, previous top implementations with their test results and current implementation with its test error message.
 Your task:
@@ -168,8 +169,8 @@ You are encouraged to draw on the following techniques (as relevant):
 - Kernel occupancy analysis
 - TorchInductor integration with Triton tuning knobs
 - Auto-tunable kernel configurations
-- Environment variable settings (e.g., ROCm tuning flags)
-- Any other performance tuning methods applicable to ROCm and AMD GPUs
+- Environment variable settings (e.g., CUDA/NVIDIA tuning flags)
+- Any other performance tuning methods applicable to NVIDIA GPUs
 
 # Original Problem:
 {instruction}
@@ -179,7 +180,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 ## Requirements:
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -231,7 +232,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 
 
 prompt_extract_strategy_1 = """
-You are an expert Python programmer specializing in writing and optimizing Triton kernels for AMD GPUs using the ROCm environment.
+You are an expert Python programmer specializing in writing and optimizing Triton kernels for NVIDIA GPUs using the CUDA environment.
 You are given the original problem, metrics information, a history of previous implementations with their test results and reflections, and one additional top implementations with its test result.
 Your task is to:
 1. Analyze the test results and reflections to determine which implementation performs better.
@@ -246,7 +247,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 ## Requirements:
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -285,11 +286,12 @@ Based on analysis, the implementation requires these EXACT function signatures:
 "```reflection
 <your reflection goes here>
 ```"
+
 """
 
 
 prompt_extract_strategy_2 = """
-You are an expert Python programmer specializing in writing and optimizing Triton kernels for AMD GPUs using the ROCm environment.
+You are an expert Python programmer specializing in writing and optimizing Triton kernels for NVIDIA GPUs using the CUDA environment.
 You are given the original problem, metrics information, two previous implementations with their test results and reflections.
 Your task is to:
 1. Analyze the test results and reflections to determine which implementation performs better.
@@ -304,7 +306,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 ## Requirements:
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -343,10 +345,12 @@ Based on analysis, the implementation requires these EXACT function signatures:
 "```reflection
 <your reflection goes here>
 ```"
+
 """
 
+
 prompt_evolve_reflect_rocm = """
-You are an expert Python programmer specializing in writing and optimizing Triton kernels for AMD GPUs using the ROCm environment.
+You are an expert Python programmer specializing in writing and optimizing Triton kernels for NVIDIA GPUs using the CUDA environment.
 You are tasked with iteratively improving a codebase.
 Given the original problem, metrics information, a history of previous implementations with their test results and reflections, previous top implementations with their test results and current implementation with its test error message, your job is to analyze the error messages and provide insights on why the solution failed and how it could be fixed. Be specific about the issues found.
 
@@ -358,7 +362,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 **Output Requirements:**
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -402,7 +406,7 @@ Primary Autotuning Fields (Mandatory)
      * 1 if two GEMMs are fused (e.g., Flash Attention).
    * Optimize for latency and execution overlap.
 3. num_warps
-    * Controls number of warps (groups of 64 threads) to launch per block.
+    * Controls number of warps (groups of 32 threads) to launch per block.
     * If it is too low then underutilization -> kernel runs slow.
     * If it is too high then register spill happens and shared memory is overused -> kernel runs slow.
     * You must choose a sweet spot by trying out integer range of 1 to 16.
@@ -448,6 +452,7 @@ pid_n = tl.program_id(1)  # Tries to get ID for a non-existent second dimension
 
 """
 
+
 prompt_evolve_strategy_optimize_rocm = """
 You are an expert in writing Triton operators for efficient GPU programming. 
 Analyze this Triton code and its performance(speedup[vs reference kernel] for e.g. (1.6x) and efficiency in TFLOPS or GB/s), and give a summary about the optimization strategy that the code uses.
@@ -464,8 +469,8 @@ You are encouraged to draw on the following techniques (as relevant):
 - Kernel occupancy analysis
 - TorchInductor integration with Triton tuning knobs
 - Auto-tunable kernel configurations
-- Environment variable settings (e.g., ROCm tuning flags)
-- Any other performance tuning methods applicable to ROCm and AMD GPUs
+- Environment variable settings (e.g., CUDA/NVIDIA tuning flags)
+- Any other performance tuning methods applicable to NVIDIA GPUs
 
 # Original Problem:
 {instruction}
@@ -499,7 +504,7 @@ Primary Autotuning Fields (Mandatory)
      * 1 if two GEMMs are fused (e.g., Flash Attention).
    * Optimize for latency and execution overlap.
 3. num_warps
-    * Controls number of warps (groups of 64 threads) to launch per block.
+    * Controls number of warps (groups of 32 threads) to launch per block.
     * If it is too low then underutilization -> kernel runs slow.
     * If it is too high then register spill happens and shared memory is overused -> kernel runs slow.
     * You must choose a sweet spot by trying out integer range of 1 to 16.

@@ -1,6 +1,7 @@
 import ast
 import os
 import subprocess
+import sys
 from random import randint
 from tqdm import tqdm
 from shutil import copyfile
@@ -11,10 +12,10 @@ import numpy as np
 import re
 
 def get_temp_bash_file(prefix='temp_code'):
-    # Generate a unique temporary file nameAdd commentMore actions
+    # Generate a unique temporary file name
     temp_file_name = f'{prefix}_{randint(999, 999999)}.sh'
     while os.path.exists(temp_file_name):
-        temp_file_name.replace('.sh', f'_{randint(999, 999999)}.sh')
+        temp_file_name = temp_file_name.replace('.sh', f'_{randint(999, 999999)}.sh')
     return temp_file_name
 
 def parse_profiler_content(profile_content):
@@ -56,7 +57,7 @@ def get_temp_file(prefix='temp_code'):
     # Generate a unique temporary file name
     temp_file_name = f'{prefix}_{randint(999, 999999)}.py'
     while os.path.exists(temp_file_name):
-        temp_file_name.replace('.py', f'_{randint(999, 999999)}.py')
+        temp_file_name = temp_file_name.replace('.py', f'_{randint(999, 999999)}.py')
     return temp_file_name
 
 def code_call_exec_success_stdout(code, fname, temp_root="tmp2", tolerance=2, verbose=False):
@@ -110,8 +111,53 @@ torch.set_printoptions(precision={tolerance},profile='full',sci_mode=False)
             f.write(line + "\n")
 
     code =  code + '\n\n' + hash_line + '\n' + '\n' + '\n'.join(test_code_lines_procs)
+
+    code += "\n\nimport os\n"
+    code += "try:\n    import torch\nexcept Exception:\n    torch = None\n"
+    code += "if os.environ.get('GEAK_PROFILE_DIAG', '0') in {'1','true','yes','y'}:\n"
+    code += "    try:\n"
+    code += "        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():\n"
+    code += "            torch.cuda.synchronize()\n"
+    code += "            print('GEAK_PROFILE_DIAG: cuda_synchronized')\n"
+    code += "        else:\n"
+    code += "            print('GEAK_PROFILE_DIAG: cuda_not_available')\n"
+    code += "    except Exception as _e:\n"
+    code += "        print('GEAK_PROFILE_DIAG: error', type(_e).__name__, str(_e))\n"
+
+    # NCU self-test: ensure at least one known CUDA kernel is launched inside the profiled process.
+    # If ncu still reports 'No kernels were profiled' with this enabled, the issue is with ncu/CUPTI/permissions.
+    code += "if os.environ.get('GEAK_NCU_SELFTEST', '0') in {'1','true','yes','y'}:\n"
+    code += "    try:\n"
+    code += "        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():\n"
+    code += "            x = torch.randn((1024,), device='cuda')\n"
+    code += "            y = x + 1\n"
+    code += "            _ = y.sum()\n"
+    code += "            torch.cuda.synchronize()\n"
+    code += "            print('GEAK_NCU_SELFTEST: launched_cuda_ops')\n"
+    code += "        else:\n"
+    code += "            print('GEAK_NCU_SELFTEST: cuda_not_available')\n"
+    code += "    except Exception as _e:\n"
+    code += "        print('GEAK_NCU_SELFTEST: error', type(_e).__name__, str(_e))\n"
+
     with open(gen_file, 'w') as f:
         f.write(code)
+
+    # Persist the generated script outside temp_root so users can reproduce profiling manually.
+    # temp_root is often deleted by the agent at the end of an iteration.
+    persist_enabled = str(os.environ.get("GEAK_PERSIST_PROFILE_SCRIPTS", "1")).lower() in {"1", "true", "yes", "y"}
+    persist_dir = os.environ.get("GEAK_PROFILE_PERSIST_DIR", "").strip()
+    persisted_gen_file = None
+    if persist_enabled:
+        if not persist_dir:
+            # Default to a stable folder under CWD.
+            persist_dir = os.path.abspath(os.path.join(os.getcwd(), "geak_profile_artifacts"))
+        try:
+            os.makedirs(persist_dir, exist_ok=True)
+            persisted_name = os.path.basename(gen_file)
+            persisted_gen_file = os.path.join(persist_dir, persisted_name)
+            copyfile(gen_file, persisted_gen_file)
+        except Exception:
+            persisted_gen_file = None
 
     ## Execute two codes gen_file and triton_file using subprocess. 
     ## 1. If gen_file return error then return status as False, and stdout and stderr from gen file
@@ -120,7 +166,7 @@ torch.set_printoptions(precision={tolerance},profile='full',sci_mode=False)
 
     try:
         # Execute the generated code
-        result_gen = subprocess.run(['python3', gen_file], capture_output=True, text=True, timeout=2*60)
+        result_gen = subprocess.run([sys.executable, gen_file], capture_output=True, text=True, timeout=2*60)
         stdout_gen = result_gen.stdout
         stderr_gen = result_gen.stderr
 
@@ -131,7 +177,7 @@ torch.set_printoptions(precision={tolerance},profile='full',sci_mode=False)
             return False, False, stdout_gen, stderr_gen
 
         # Execute the Triton code
-        result_triton = subprocess.run(['python3', temp_triton_file], capture_output=True, text=True, timeout=2*60)
+        result_triton = subprocess.run([sys.executable, temp_triton_file], capture_output=True, text=True, timeout=2*60)
         stdout_triton = result_triton.stdout
         stderr_triton = result_triton.stderr
 
@@ -172,7 +218,7 @@ torch.set_printoptions(precision={tolerance},profile='full',sci_mode=False)
         #     os.remove(gen_file)
     return False, False, None, None
 
-def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", atol=1e-3, rtol=1e-1, timeout=6*60, verbose=False):
+def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", atol=1e-3, rtol=1e-1, timeout=6*60, verbose=False, gpu_id=None):
     tmp_gen_folder = os.path.join(temp_root, "gen")
     os.makedirs(tmp_gen_folder, exist_ok=True)
     
@@ -184,43 +230,171 @@ def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", 
     gen_file = os.path.join(tmp_gen_folder, gen_file)
     
     fname_split = fname.split('.')[0]
-    gen_bash_file = get_temp_bash_file(prefix=f'{fname_split}_gen_triton_code')
-    gen_bash_file = os.path.join(tmp_gen_folder, gen_bash_file)
-
     hash_line = "#"*146
 
+    harness_source = "hash_line"
+    harness_found = False
     with open(triton_file, 'r') as f:
         lines = f.readlines()
-        for iL, line in enumerate(lines):
+        iL = None
+        for idx, line in enumerate(lines):
             if line.strip() == hash_line:
+                iL = idx
+                harness_found = True
                 break
-        test_code_lines = lines[iL+1:]
-        test_code_lines_procs = test_code_lines
+
+        if harness_found and iL is not None:
+            test_code_lines_procs = lines[iL + 1:]
+        else:
+            # Fallback: if the file does not contain the expected delimiter, try to include
+            # the executable entrypoint so the script actually runs (and launches kernels).
+            harness_source = "__main__"
+            main_idx = None
+            for idx, line in enumerate(lines):
+                if "if __name__" in line and "__main__" in line:
+                    main_idx = idx
+                    break
+            if main_idx is not None:
+                test_code_lines_procs = lines[main_idx:]
+                harness_found = True
+            else:
+                # Last resort: include nothing; we'll surface this explicitly in stdout_analyze.
+                test_code_lines_procs = []
 
     # code = process_code(code)
 
     code =  code + '\n\n' + hash_line + '\n' + '\n' + '\n'.join(test_code_lines_procs)
     
-    code_bash = f"python3 {gen_file}"
+    code += "\n\nimport os\n"
+    code += "try:\n    import torch\nexcept Exception:\n    torch = None\n"
+    code += "if os.environ.get('GEAK_PROFILE_DIAG', '0') in {'1','true','yes','y'}:\n"
+    code += "    try:\n"
+    code += "        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():\n"
+    code += "            torch.cuda.synchronize()\n"
+    code += "            print('GEAK_PROFILE_DIAG: cuda_synchronized')\n"
+    code += "        else:\n"
+    code += "            print('GEAK_PROFILE_DIAG: cuda_not_available')\n"
+    code += "    except Exception as _e:\n"
+    code += "        print('GEAK_PROFILE_DIAG: error', type(_e).__name__, str(_e))\n"
+
+    # NCU self-test: ensure at least one known CUDA kernel is launched inside the profiled process.
+    # If ncu still reports 'No kernels were profiled' with this enabled, the issue is with ncu/CUPTI/permissions.
+    code += "if os.environ.get('GEAK_NCU_SELFTEST', '0') in {'1','true','yes','y'}:\n"
+    code += "    try:\n"
+    code += "        if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():\n"
+    code += "            x = torch.randn((1024,), device='cuda')\n"
+    code += "            y = x + 1\n"
+    code += "            _ = y.sum()\n"
+    code += "            torch.cuda.synchronize()\n"
+    code += "            print('GEAK_NCU_SELFTEST: launched_cuda_ops')\n"
+    code += "        else:\n"
+    code += "            print('GEAK_NCU_SELFTEST: cuda_not_available')\n"
+    code += "    except Exception as _e:\n"
+    code += "        print('GEAK_NCU_SELFTEST: error', type(_e).__name__, str(_e))\n"
+
     with open(gen_file, 'w') as f:
         f.write(code)
-    with open(gen_bash_file, 'w') as f:
-        f.write(code_bash)
+
+    # Persist the generated script outside temp_root so users can reproduce profiling manually.
+    # temp_root is often deleted by the agent at the end of an iteration.
+    persist_enabled = str(os.environ.get("GEAK_PERSIST_PROFILE_SCRIPTS", "1")).lower() in {"1", "true", "yes", "y"}
+    persist_dir = os.environ.get("GEAK_PROFILE_PERSIST_DIR", "").strip()
+    persisted_gen_file = None
+    if persist_enabled:
+        if not persist_dir:
+            # Default to a stable folder under CWD.
+            persist_dir = os.path.abspath(os.path.join(os.getcwd(), "geak_profile_artifacts"))
+        try:
+            os.makedirs(persist_dir, exist_ok=True)
+            persisted_name = os.path.basename(gen_file)
+            persisted_gen_file = os.path.join(persist_dir, persisted_name)
+            copyfile(gen_file, persisted_gen_file)
+        except Exception:
+            persisted_gen_file = None
+
     try:
-        ## Just to a simple call to the generated code
-        result_profile = subprocess.run([f'rocprof-compute profile -n {fname_split}  -- /bin/bash {gen_bash_file}'], capture_output=True, text=True, timeout=timeout, shell=True)
-        analyze_profile = subprocess.run([f'rocprof-compute analyze -p workloads/{fname_split}/{target_gpu}'], capture_output=True, text=True, timeout=timeout, shell=True)
-        
-        # abstract profiling info
+        ncu_exe = os.environ.get("NCU_BIN", "ncu")
+        # Default to a rich metric set so the prompt has actionable info.
+        # Users can override via NCU_SET (e.g., "launch", "speedOfLight", etc.).
+        ncu_set = os.environ.get("NCU_SET", "full")
+        ncu_sections = os.environ.get("NCU_SECTIONS", "")
+        ncu_metrics = os.environ.get("NCU_METRICS", "")
+        ncu_extra_args = os.environ.get("NCU_EXTRA_ARGS", "")
+
+        # Some ncu flags (notably --target-processes all) can change behavior significantly.
+        # Default to the simplest manual workflow unless explicitly enabled.
+        ncu_target_processes = os.environ.get("NCU_TARGET_PROCESSES", "").strip()
+        ncu_force_overwrite = str(os.environ.get("NCU_FORCE_OVERWRITE", "0")).lower() in {"1", "true", "yes", "y"}
+        ncu_profile_from_start = os.environ.get("NCU_PROFILE_FROM_START", "").strip()
+
+        # Use a deterministic report path so downstream code can store it as an artifact.
+        # ncu produces a .ncu-rep report for both --export and -o.
+        report_base = os.path.join(tmp_gen_folder, f"{fname_split}_ncu_report")
+        report_rep = report_base + ".ncu-rep"
+
+        # Ensure output directory exists (especially when report_base includes a path).
+        try:
+            os.makedirs(os.path.dirname(report_base), exist_ok=True)
+        except Exception:
+            pass
+
+        # Match the simplest (and most commonly working) CLI pattern by default:
+        #   ncu --set full -o report python script.py
+        # Some environments behave better with `-o` than `--export`.
+        # You can restore the old behavior via: NCU_OUTPUT_MODE=export
+        ncu_output_mode = os.environ.get("NCU_OUTPUT_MODE", "o").strip().lower()
+
+        ncu_args = [ncu_exe]
+        if ncu_target_processes:
+            ncu_args += ["--target-processes", ncu_target_processes]
+        if ncu_force_overwrite:
+            ncu_args += ["--force-overwrite", "true"]
+
+        if ncu_output_mode == "export":
+            ncu_args += ["--profile-from-start", "on", "--export", report_base]
+        else:
+            # Default: generate a .ncu-rep report file named `<report_base>.ncu-rep`.
+            ncu_args += ["-o", report_base]
+
+        # Allow overriding profile-from-start for both modes.
+        if ncu_profile_from_start:
+            ncu_args += ["--profile-from-start", ncu_profile_from_start]
+
+        if ncu_set:
+            ncu_args += ["--set", ncu_set]
+        if ncu_sections:
+            for section in [s.strip() for s in ncu_sections.split(",") if s.strip()]:
+                ncu_args += ["--section", section]
+        if ncu_metrics:
+            ncu_args += ["--metrics", ncu_metrics]
+        if ncu_extra_args:
+            ncu_args += ncu_extra_args.split()
+
+        ncu_args += [sys.executable, gen_file]
+
+        run_env = dict(os.environ)
+        if gpu_id is not None:
+            run_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        run_env["GEAK_NCU_SELFTEST"] = run_env.get("GEAK_NCU_SELFTEST", "1")
+
+        result_profile = subprocess.run(
+            ncu_args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+            env=run_env,
+        )
+
         profile_status = result_profile.returncode == 0
         stdout_profile = result_profile.stdout
         stderr_profile = result_profile.stderr
-    
+
     except Exception as e:
         if verbose:
             print(f"File: {fname}, Execution error: {e}")
         return None, None, str(e), None
-    
+
     # Clean up the temporary file
     except subprocess.TimeoutExpired:
         if verbose:
@@ -228,7 +402,7 @@ def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", 
         return None, None, "Time out", None
     finally:
         pass
-    
+
     # Check if the generated code executed successfully
     if result_profile.returncode != 0:
         if verbose:
@@ -237,27 +411,136 @@ def code_kernel_profiling(code, fname, py_folder, target_gpu, temp_root="tmp2", 
         if verbose:
             print(f"Success in in profiling kernel")
     try:
-        section_text = parse_profiler_content(analyze_profile.stdout)
-        stdout_analyze = "\nBelow are some profiling info of this kernel generated by the tool of rocprof-compute on AMD MI250 gpu, you can reference these info to analyze and generate better kernel."
-        stdout_analyze += "\n1.Overview:Briefly describe the kernel type along with its runtime and dispatch statistics, such as the main kernel name, invocation count, and average execution time."
-        stdout_analyze += f"\n{section_text['0']}"
-        stdout_analyze += "\n2.Hardware & Resources:Key hardware details including model, architecture, number of CUs, capacities of LDS/SMEM/registers, and maximum workgroup size."
-        stdout_analyze += f"\n{section_text['1']}"
-        stdout_analyze += "\n3.Performance Utilization & Bottlenecks:Core bottleneck indicators such as FLOPs utilization, active CUs, occupancy, and memory bandwidth/utilization."
-        stdout_analyze += f"\n{section_text['2']}"
-        stdout_analyze += "\n4.Instruction Mix & Memory Access:Distribution of arithmetic, memory, and branch instructions (e.g., MFMA/FMA/VALU/VMEM), cache hit rates (L1/L2), memory bandwidth, and conflict statistics."
-        stdout_analyze += f"\n{section_text['10']}"
-        stdout_analyze += f"\n{section_text['16']}"
-        stdout_analyze += f"\n{section_text['17']}"
-        stdout_analyze += "\n5.Threading & Allocation:Wavefront/workgroup counts, allocation of VGPRs/SGPRs/LDS, thread concurrency, and resource usage per thread or workgroup."
-        stdout_analyze += f"\n{section_text['7']}"
+        max_chars = int(os.environ.get("NCU_OUTPUT_CHARS", "8000"))
+        cmd_str = " ".join(f'"{a}"' if (" " in a or "\t" in a) else a for a in ncu_args)
+
+        no_kernels_profiled = "No kernels were profiled" in str(stdout_profile or "") or "No kernels were profiled" in str(stderr_profile or "")
+
+        stdout_analyze = "\nBelow is Nsight Compute (ncu) profiling output for this kernel on an NVIDIA GPU."
+        stdout_analyze += "\nCommand:\n" + cmd_str
+        stdout_analyze += "\nReport (base path):\n" + report_base
+        stdout_analyze += "\nReport (.ncu-rep):\n" + report_rep
+        stdout_analyze += f"\nNCU output mode: {ncu_output_mode}"
+        stdout_analyze += f"\nNCU target-processes: {ncu_target_processes if ncu_target_processes else '<unset>'}"
+        stdout_analyze += f"\nNCU force-overwrite: {ncu_force_overwrite}"
+        stdout_analyze += f"\nNCU profile-from-start: {ncu_profile_from_start if ncu_profile_from_start else '<unset>'}"
+        stdout_analyze += f"\nNCU returncode: {result_profile.returncode}"
+        stdout_analyze += f"\nCUDA_VISIBLE_DEVICES: {run_env.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        stdout_analyze += f"\nHarness extraction: source={harness_source}, found={harness_found}, appended_lines={len(test_code_lines_procs)}"
+        if persisted_gen_file:
+            stdout_analyze += "\nPersisted gen_file:\n" + persisted_gen_file
+        else:
+            stdout_analyze += "\nPersisted gen_file:\n<disabled_or_failed>"
+
+        # Capture the exact ncu version used (important when multiple CUDA toolkits exist).
+        try:
+            ver = subprocess.run(
+                [ncu_exe, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                shell=False,
+                env=run_env,
+            )
+            ver_out = (ver.stdout or "").strip() or "<empty>"
+            ver_err = (ver.stderr or "").strip() or "<empty>"
+            stdout_analyze += f"\nNCU version returncode: {ver.returncode}"
+            stdout_analyze += "\n[NCU VERSION STDOUT]\n" + ver_out
+            stdout_analyze += "\n[NCU VERSION STDERR]\n" + ver_err
+        except Exception as _e:
+            stdout_analyze += f"\nNCU version: <error> {type(_e).__name__}: {_e}"
+
+        combined = ""
+        if stdout_profile:
+            combined += "\n[NCU STDOUT]\n" + stdout_profile
+
+        # Always include stderr section to avoid ambiguity (empty stderr is still useful information).
+        combined += "\n[NCU STDERR]\n" + (stderr_profile if stderr_profile else "<empty>")
+
+        # Always capture the raw script's stdout/stderr as ground truth when diagnosing profiling.
+        # This helps distinguish:
+        # - script never reached GPU kernel launch (likely)
+        # - script launched kernels but ncu failed to capture them (tool/config/environment)
+        if True:
+            try:
+                diag_timeout = int(os.environ.get("NCU_DIAG_TIMEOUT", "120"))
+            except Exception:
+                diag_timeout = 120
+
+            try:
+                diag_env = dict(os.environ)
+                diag_env["GEAK_PROFILE_DIAG"] = "1"
+                diag_env["GEAK_NCU_SELFTEST"] = diag_env.get("GEAK_NCU_SELFTEST", "1")
+                if gpu_id is not None:
+                    diag_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                diag = subprocess.run(
+                    [sys.executable, gen_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=min(timeout, diag_timeout),
+                    shell=False,
+                    env=diag_env,
+                )
+                diag_out = diag.stdout if diag.stdout else "<empty>"
+                diag_err = diag.stderr if diag.stderr else "<empty>"
+                combined += "\n[SCRIPT DIAG]\n"
+                combined += f"ReturnCode: {diag.returncode}\n"
+                combined += "[SCRIPT STDOUT]\n" + diag_out
+                combined += "\n[SCRIPT STDERR]\n" + diag_err
+            except subprocess.TimeoutExpired:
+                combined += "\n[SCRIPT DIAG]\nReturnCode: <timeout>\n"
+            except Exception as e:
+                combined += f"\n[SCRIPT DIAG]\nReturnCode: <error>\nError: {type(e).__name__}: {e}\n"
+
+        # If we produced a report, try to import it to get a readable summary for prompt injection.
+        # This mirrors the user's manual workflow: `ncu --import xxx.ncu-rep`.
+        try:
+            report_exists = os.path.exists(report_rep)
+            combined += f"\n[NCU REPORT EXISTS]\n{report_exists}"
+            if not report_exists:
+                try:
+                    nearby = []
+                    base_dir = os.path.dirname(report_base)
+                    if base_dir and os.path.isdir(base_dir):
+                        for fn in os.listdir(base_dir):
+                            if fn.startswith(f"{fname_split}_ncu_report"):
+                                nearby.append(fn)
+                    if nearby:
+                        combined += "\n[NCU REPORT NEARBY FILES]\n" + "\n".join(sorted(nearby))
+                except Exception:
+                    pass
+
+            if report_exists:
+                import_args = [ncu_exe, "--import", report_rep]
+                import_cmd_str = " ".join(f'"{a}"' if (" " in a or "\t" in a) else a for a in import_args)
+                imported = subprocess.run(
+                    import_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(timeout, 180),
+                    shell=False,
+                    env=run_env,
+                )
+                combined += "\n[NCU IMPORT CMD]\n" + import_cmd_str
+                combined += f"\n[NCU IMPORT RETURN]\n{imported.returncode}"
+                combined += "\n[NCU IMPORT STDOUT]\n" + (imported.stdout if imported.stdout else "<empty>")
+                combined += "\n[NCU IMPORT STDERR]\n" + (imported.stderr if imported.stderr else "<empty>")
+        except subprocess.TimeoutExpired:
+            combined += "\n[NCU IMPORT]\n<timeout>\n"
+        except Exception as e:
+            combined += f"\n[NCU IMPORT]\n<error> {type(e).__name__}: {e}\n"
+
+        if combined and len(combined) > max_chars:
+            combined = combined[:max_chars] + "\n...<truncated>...\n"
+
+        stdout_analyze += combined
     except Exception as e:
         return None, None, str(e), None
     return profile_status, stdout_profile, stderr_profile, stdout_analyze
 
 def extract_code_from_llm_output(response):
     # Extract code blocks from the LLM response
-    code = None
+    code = ""
     if "```" not in response:
         return response
     code_blocks = extract_code_blocks(response)
@@ -276,7 +559,7 @@ def get_fname_difficulty_from_label(label):
 
 def process_code(code: str):
     if "```python" in code:
-        code = code.split("```python")[-1].replace("<|im_end|>", "").replace("<|EOT|>", "")
+        code = code.split("```python")[-1].strip().replace("```", "").replace("<|EOT|>", "")
     
     try:
         tree = ast.parse(code)
@@ -331,11 +614,11 @@ def code_call_exec_success_allclose(code, fname, py_folder, temp_root="tmp2", at
 
     try:
         ## Just to a simple call to the generated code
-        result_call = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 {gen_file}'], capture_output=True, text=True, timeout=timeout, shell=True)
+        result_call = subprocess.run([f'CUDA_VISIBLE_DEVICES={gpu_id} "{sys.executable}" "{gen_file}"'], capture_output=True, text=True, timeout=timeout, shell=True)
         call_status = result_call.returncode == 0
 
         # Check for correctness
-        result_corr = subprocess.run([f'HIP_VISIBLE_DEVICES={gpu_id} python3 dataloaders/TB_eval/correctness.py --gen_file {gen_file} --ref_file {triton_file} --atol {atol} --rtol {rtol}'], capture_output=True, text=True, timeout=timeout, shell=True)
+        result_corr = subprocess.run([f'CUDA_VISIBLE_DEVICES={gpu_id} "{sys.executable}" dataloaders/TB_eval/correctness.py --gen_file "{gen_file}" --ref_file "{triton_file}" --atol {atol} --rtol {rtol}'], capture_output=True, text=True, timeout=timeout, shell=True)
         stdout_corr = result_corr.stdout
         stderr_corr = result_corr.stderr
 

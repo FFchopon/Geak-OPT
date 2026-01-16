@@ -1,9 +1,8 @@
-
 prompt = """
-You are an expert Python programmer specializing in NVIDIA Triton kernels, specifically targeting **AMD GPUs using the ROCm environment**.
+You are an expert Python programmer specializing in Triton kernels, specifically targeting **NVIDIA GPUs using the CUDA environment**.
 Your task is to generate a Python code snippet containing a Triton kernel based on the following request:
 
-**Target Platform:** AMD GPU (ROCm)
+**Target Platform:** NVIDIA GPU (CUDA)
 
 **Request:**
 {instruction}
@@ -12,8 +11,10 @@ Your task is to generate a Python code snippet containing a Triton kernel based 
 Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
+{reference_section}
+
 **Output Requirements:**
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -37,7 +38,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
     *   **`tl.dot`:** Ensure inputs are 2D blocks and have compatible types (e.g., float16, bfloat16). Int32 is generally not supported directly as input.
     *   **`tl.arange`:** Arguments `start` and `end` **must be `tl.constexpr`**.
     *   **Math:** Use functions from `tl.math` where available (e.g., `tl.math.exp`, `tl.math.sqrt`). Check function existence; avoid assuming functions like `tanh` or `log1p` exist if they don't in `tl.math`.
-8.  **Triton Version:** Assume Triton version 3.1.0 or later.
+8.  **Triton Version:** Assume Triton version 3.2.0 or later.
 
 **FINAL VERIFICATION:**
 Before completing, verify:
@@ -46,7 +47,7 @@ Before completing, verify:
 3. No functions are called without being defined.
 4. No parameters are missing from your implementations.
 
-**Generated AMD ROCm Compatible Triton Kernel Code:**
+**Generated NVIDIA CUDA Compatible Triton Kernel Code:**
 """
 
 system_prompt = """\nThink before writing the optimization and no more explanation is required after the thinking. 
@@ -54,7 +55,6 @@ You should not suggest changes to the name of the function and parameter names, 
 Output your answer in json format, with the format as follows: {\"strategy\": \"\", \"code\": \"\"}. Please strictly output in JSON format.
 Generate the strategy that used to correct and optimized code in the \"strategy\" field."
 Generate the correct and optimized code without explanation, which we can run directly in the \"code\" field."""
-
 
 llm_evaluate_prompt = """
 Evaluate the following Triton kernel on a scale of 0.0 to 1.0 for each of the listed criteria.
@@ -65,11 +65,11 @@ For each criteria you must provide:
 
 **Evaluation Criteria:**
 1. Fusion Intelligence: Does the kernel smartly fuse compatible operations to reduce memory I/O and kernel launches?
-2. Autotuning Coverage: Does it use `@triton.autotune`? Are the tuning ranges meaningful, diverse, and AMD MI250 GPU hardware-appropriate? (Assign 0.0 if no autotuning config is present.)
+2. Autotuning Coverage: Does it use `@triton.autotune`? Are the tuning ranges meaningful and diverse for the target NVIDIA GPU? (Assign 0.0 if no autotuning config is present.)
 3. Memory Access Efficiency: Does it optimize memory layout, coalesced access, and reduce redundant reads/writes?
 4. Algorithmic complexity: Does it fuse multiple for-loops in one smartly? Are there redundant nested for-loops?
-5. Warp/Wavefront Utilization: Does it use thread blocks that fully utilize compute units on the target GPU (e.g., MI250)?
-6. Software pipelining: Does it explore good enough range for num_stages? Valid range for MI250 GPU is [1,16]. For invalid values assign score of 0.0.
+5. Warp Utilization: Does it use thread blocks and `num_warps` that utilize SMs well on the target NVIDIA GPU?
+6. Software pipelining: Does it explore a reasonable range for `num_stages`? Valid range is typically [1,16]. For invalid values assign score of 0.0.
 7. Numerical Stability: Is it numerically safe for large input ranges (e.g., uses max-subtraction in softmax, clamps, etc.)?
 8. Correctness and Portability: Does the kernel handle edge cases (e.g., sizes not divisible by block size)? Is it portable across Triton-supported devices?
 9. Optimization scope: Is the given kernel missing techniques from well-known optimizations methods? e.g. softmax kernel vs online softmax vs fused softmax. If the kernel is already most optimal then assign a score of 1.0.
@@ -85,7 +85,7 @@ Provide scores and reasoning for each evaluation criteria in the JSON format as 
     "autotuning_coverage": score,
     "memory_access_efficiency": score,
     "algorithmic_complexity": score,
-    "warp_wavefront_utilization: score,
+    "warp_utilization": score,
     "software_pipelining": score,
     "numerical_stability": score,
     "correctness_and_portability": score,
@@ -95,10 +95,10 @@ Provide scores and reasoning for each evaluation criteria in the JSON format as 
 """
 
 prompt_rocm = """
-You are an expert Python programmer specializing in NVIDIA Triton kernels, specifically targeting **AMD GPUs using the ROCm environment**.
+You are an expert Python programmer specializing in Triton kernels, specifically targeting **NVIDIA GPUs using the CUDA environment**.
 Your task is to generate a Python code snippet containing a Triton kernel based on the following request:
 
-**Target Platform:** AMD GPU (ROCm)
+**Target Platform:** NVIDIA GPU (CUDA)
 
 **Request:**
 {instruction}
@@ -108,7 +108,7 @@ Based on analysis, the implementation requires these EXACT function signatures:
 {function_signatures}
 
 **Output Requirements:**
-1.  **AMD Compatibility:** Generate code compatible with AMD GPUs and ROCm. **DO NOT use CUDA-specific features or functions (e.g., `tl.libdevice`).**
+1.  **NVIDIA Compatibility:** Generate code compatible with NVIDIA GPUs and CUDA.
 2.  **Complete Code:** Generate a single, complete, and syntactically correct Python code block.
 3.  **Triton Kernel:** The core logic must be implemented within a Triton kernel function decorated with `@triton.jit`.
 4.  **Imports:** ALWAYS include necessary imports at the beginning:
@@ -152,7 +152,7 @@ Primary Autotuning Fields (Mandatory)
      * 1 if two GEMMs are fused (e.g., Flash Attention).
    * Optimize for latency and execution overlap.
 3. num_warps
-    * Controls number of warps (groups of 64 threads) to launch per block.
+    * Controls number of warps (groups of 32 threads) to launch per block.
     * If it is too low then underutilization -> kernel runs slow.
     * If it is too high then register spill happens and shared memory is overused -> kernel runs slow.
     * You must choose a sweet spot by trying out integer range of 1 to 16.

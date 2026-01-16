@@ -2,6 +2,8 @@ from agents.GaAgent import GaAgent
 from models.OpenAI import OpenAIModel
 from models.Gemini import GeminiModel
 from models.Claude import ClaudeModel
+from models.DeepSeek import DeepSeekModel
+from models.Qwen import QwenModel
 from dataloaders.TritonBench import TritonBench
 from args_config import load_config
 
@@ -10,7 +12,19 @@ def main():
     args = load_config("configs/tritonbench_gaagent_config.yaml")
 
     # setup LLM model
-    model = ClaudeModel(api_key=args.api_key, model_id=args.model_id)
+    model_backend = getattr(args, "model_backend", "claude")
+    if model_backend == "claude":
+        model = ClaudeModel(api_key=args.api_key, model_id=args.model_id)
+    elif model_backend == "openai":
+        model = OpenAIModel(api_key=args.api_key, model_id=args.model_id)
+    elif model_backend == "gemini":
+        model = GeminiModel(api_key=args.api_key, model_id=args.model_id)
+    elif model_backend == "deepseek":
+        model = DeepSeekModel(api_key=args.api_key, model_id=args.model_id)
+    elif model_backend == "qwen":
+        model = QwenModel(api_key=args.api_key, model_id=args.model_id)
+    else:
+        raise ValueError(f"Unsupported model_backend: {model_backend}")
 
     # setup dataset
     dataset = TritonBench(statis_path=args.statis_path, 
