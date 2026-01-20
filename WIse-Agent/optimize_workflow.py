@@ -42,6 +42,10 @@ NCU_SET = "full"
 NCU_FULL_REPORT = 0
 MODEL_NAME = "qwen3-coder-plus"
 
+EXPERIENCE_DELTA_THRESHOLD = 0.05
+EXPERIENCE_FILENAME = "optimization_experience.txt"
+LESSONS_FILENAME = "optimization_lessons.txt"
+
 API_MAX_RETRIES = 6
 API_RETRY_BACKOFF_S = 2.0
 API_RETRY_MAX_BACKOFF_S = 30.0
@@ -108,6 +112,66 @@ def _get_plan_priority(plan) -> int | None:
         return int(p)
     except Exception:
         return None
+
+
+def _draft_experience_prompt(strategy: str, before_impl: str, after_impl: str, before_ncu: str, after_ncu: str) -> str:
+    return f"""你是一个资深 Triton/GPU kernel 性能优化工程师，擅长从“优化策略 + 代码 diff + profiling 对比”中总结可迁移的优化经验。
+
+【输入信息】
+本次带来显著 speedup 的优化策略（原样提供）：
+{strategy}
+
+优化前算子实现代码（before）：
+{before_impl}
+
+优化后算子实现代码（after）：
+{after_impl}
+
+优化前算子的 ncu profiling 关键结果（before）：
+{before_ncu}
+
+优化后算子的 ncu profiling 关键结果（after）：
+{after_ncu}
+
+【任务】
+请提炼一段可复用的“优化经验”，要求包含：
+1) 改动内容：用可迁移的语言总结（例如：block/tile 调整、num_warps/num_stages、pid 映射、访存对齐/连续性提示等），点出 before->after 的关键变化。
+2) 改动后效果：用“预期带来的性能变化原因”来解释（例如提高并行度/占用率、改善 coalescing、减少冗余 load 等），不要杜撰具体数值。
+3) 适用条件与注意事项：说明在什么输入规模/访存模式下可能有效，哪些情况下可能无效或引入风险。
+
+【输出要求】
+- 仅输出一段纯文本（100~250 字），不要输出列表，不要输出 JSON，不要输出 Markdown。
+"""
+
+
+def _draft_lesson_prompt(strategy: str, before_impl: str, after_impl: str, before_ncu: str, after_ncu: str) -> str:
+    return f"""你是一个资深 Triton/GPU kernel 性能优化工程师，擅长从失败或负收益的优化尝试中总结“优化教训”，用于指导后续避免踩坑。
+
+【输入信息】
+本次优化尝试使用的策略（原样提供）：
+{strategy}
+
+优化前算子实现代码（before）：
+{before_impl}
+
+优化后算子实现代码（after）：
+{after_impl}
+
+优化前算子的 ncu profiling 关键结果（before）：
+{before_ncu}
+
+优化后算子的 ncu profiling 关键结果（after）：
+{after_ncu}
+
+【任务】
+请提炼一段可复用的“优化教训”，要求包含：
+1) 改动内容：概括 before->after 的关键变化。
+2) 负收益/退化的可能原因：结合 profiling 变化，从并行度、occupancy、访存模式、额外开销、divergence、serialization 等角度分析。
+3) 后续建议：给出明确的规避建议或替代方向（仍限定在 Triton kernel 实现层面）。
+
+【输出要求】
+- 仅输出一段纯文本（100~250 字），不要输出列表，不要输出 JSON，不要输出 Markdown。
+"""
 
 
 def _qwen_chat(messages: list[dict], temperature: float = 0.7) -> str:
@@ -187,7 +251,6 @@ def _strip_opt_lines(text: str) -> str:
         return ""
     out_lines = []
     for line in text.splitlines():
-        # Drop any row/line that contains an OPT token (case-insensitive).
         if re.search(r"\bOPT\b", line, flags=re.I):
             continue
         out_lines.append(line.rstrip())
@@ -535,6 +598,24 @@ def main():
 
     base_impl = ref_op
     best_speedup_so_far = 1.0
+    experience_path = os.path.join(os.path.abspath(OUTPUT_ROOT), EXPERIENCE_FILENAME)
+    lessons_path = os.path.join(os.path.abspath(OUTPUT_ROOT), LESSONS_FILENAME)
+
+    experience_text = ""
+    if os.path.isfile(experience_path):
+        try:
+            with open(experience_path, "r", encoding="utf-8") as f:
+                experience_text = f.read().strip()
+        except Exception:
+            experience_text = ""
+
+    lessons_text = ""
+    if os.path.isfile(lessons_path):
+        try:
+            with open(lessons_path, "r", encoding="utf-8") as f:
+                lessons_text = f.read().strip()
+        except Exception:
+            lessons_text = ""
     history = []
 
     for r in range(1, int(NUM_ROUNDS) + 1):
@@ -576,7 +657,15 @@ def main():
 
         src = _read_operator_impl(base_impl)
 
-        step1_prompt_full = _draft_step1_prompt(src, table, int(TUNE_NUMS_PER_BOTTLENECK))
+        experience_prefix = ""
+        if experience_text:
+            experience_prefix += "【历史优化经验（可参考，不得违反硬性约束）】\n" + experience_text.strip() + "\n\n"
+            experience_prefix += "【以上为历史优化经验】\n\n"
+        if lessons_text:
+            experience_prefix += "【历史优化教训（请避免重复踩坑，不得违反硬性约束）】\n" + lessons_text.strip() + "\n\n"
+            experience_prefix += "【以上为历史优化教训】\n\n"
+
+        step1_prompt_full = experience_prefix + _draft_step1_prompt(src, table, int(TUNE_NUMS_PER_BOTTLENECK))
         step1_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": step1_prompt_full},
@@ -687,12 +776,128 @@ def main():
                 best_child_speedup = speedup_val
                 best_child = child_info
 
-        accept = bool(best_child) and best_child_speedup > float(best_speedup_so_far)
+        base_impl_before_update = base_impl
+        prev_best_speedup = float(best_speedup_so_far)
+        accept = bool(best_child) and best_child_speedup > float(prev_best_speedup)
+        significant_improvement = bool(best_child) and (
+            (float(best_child_speedup) - float(prev_best_speedup)) >= float(EXPERIENCE_DELTA_THRESHOLD)
+        )
+        no_significant_improvement = bool(best_child) and (not significant_improvement)
         if accept:
             base_impl = best_child["candidate"]
             best_speedup_so_far = float(best_child_speedup)
         else:
             base_impl = base_impl
+
+        if significant_improvement:
+            try:
+                before_impl = _read_operator_impl(base_impl_before_update)
+                after_impl = _read_operator_impl(best_child["candidate"])
+                before_ncu = table
+                after_report_base = os.path.abspath(os.path.join(OUTPUT_ROOT, f"{REPORT_PREFIX}_r{r}_{op_name}__exp_after"))
+                _, _, after_ncu = _profile_first_input(best_child["candidate"], op_name, os.path.abspath(OUTPUT_ROOT), after_report_base)
+
+                strategy = best_child.get("plan")
+                if isinstance(strategy, dict):
+                    strategy_text = json.dumps(strategy, ensure_ascii=False, indent=2)
+                else:
+                    strategy_text = str(strategy)
+
+                exp_prompt = _draft_experience_prompt(strategy_text, before_impl, after_impl, before_ncu, after_ncu)
+                exp_messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": exp_prompt},
+                ]
+                exp_text = _qwen_chat(exp_messages, temperature=0.2).strip()
+
+                if exp_text:
+                    exp_entry = f"Round {r}\n{exp_text}".strip()
+                    if experience_text:
+                        experience_text = experience_text.rstrip() + "\n\n" + exp_entry
+                    else:
+                        experience_text = exp_entry
+
+                    with open(experience_path, "w", encoding="utf-8") as f:
+                        f.write(experience_text.strip() + "\n")
+
+                    if round_dir:
+                        with open(os.path.join(round_dir, "experience_prompt.txt"), "w", encoding="utf-8") as f:
+                            f.write(exp_prompt)
+                        with open(os.path.join(round_dir, "experience.txt"), "w", encoding="utf-8") as f:
+                            f.write(exp_entry + "\n")
+                        with open(os.path.join(round_dir, "before_impl.py"), "w", encoding="utf-8") as f:
+                            f.write(before_impl)
+                        with open(os.path.join(round_dir, "after_impl.py"), "w", encoding="utf-8") as f:
+                            f.write(after_impl)
+                        with open(os.path.join(round_dir, "profile_before.txt"), "w", encoding="utf-8") as f:
+                            f.write(before_ncu)
+                        with open(os.path.join(round_dir, "profile_after.txt"), "w", encoding="utf-8") as f:
+                            f.write(after_ncu)
+            except Exception:
+                pass
+
+        if no_significant_improvement:
+            try:
+                worst_child = None
+                worst_speedup = float("inf")
+                for c in children:
+                    if not c.get("runnable_ok") or not c.get("correct_ok"):
+                        continue
+                    try:
+                        s = float(c.get("speedup", 0) or 0)
+                    except Exception:
+                        s = 0.0
+                    if s <= 0:
+                        continue
+                    if s < worst_speedup:
+                        worst_speedup = s
+                        worst_child = c
+
+                if worst_child is not None:
+                    before_impl = _read_operator_impl(base_impl_before_update)
+                    after_impl = _read_operator_impl(worst_child["candidate"])
+                    before_ncu = table
+                    after_report_base = os.path.abspath(os.path.join(OUTPUT_ROOT, f"{REPORT_PREFIX}_r{r}_{op_name}__lesson_after"))
+                    _, _, after_ncu = _profile_first_input(worst_child["candidate"], op_name, os.path.abspath(OUTPUT_ROOT), after_report_base)
+
+                    strategy = worst_child.get("plan")
+                    if isinstance(strategy, dict):
+                        strategy_text = json.dumps(strategy, ensure_ascii=False, indent=2)
+                    else:
+                        strategy_text = str(strategy)
+
+                    lesson_prompt = _draft_lesson_prompt(strategy_text, before_impl, after_impl, before_ncu, after_ncu)
+                    lesson_messages = [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": lesson_prompt},
+                    ]
+                    lesson_text = _qwen_chat(lesson_messages, temperature=0.2).strip()
+
+                    if lesson_text:
+                        lesson_entry = f"Round {r}\n{lesson_text}".strip()
+                        if lessons_text:
+                            lessons_text = lessons_text.rstrip() + "\n\n" + lesson_entry
+                        else:
+                            lessons_text = lesson_entry
+
+                        with open(lessons_path, "w", encoding="utf-8") as f:
+                            f.write(lessons_text.strip() + "\n")
+
+                        if round_dir:
+                            with open(os.path.join(round_dir, "lesson_prompt.txt"), "w", encoding="utf-8") as f:
+                                f.write(lesson_prompt)
+                            with open(os.path.join(round_dir, "lesson.txt"), "w", encoding="utf-8") as f:
+                                f.write(lesson_entry + "\n")
+                            with open(os.path.join(round_dir, "lesson_before_impl.py"), "w", encoding="utf-8") as f:
+                                f.write(before_impl)
+                            with open(os.path.join(round_dir, "lesson_after_impl.py"), "w", encoding="utf-8") as f:
+                                f.write(after_impl)
+                            with open(os.path.join(round_dir, "lesson_profile_before.txt"), "w", encoding="utf-8") as f:
+                                f.write(before_ncu)
+                            with open(os.path.join(round_dir, "lesson_profile_after.txt"), "w", encoding="utf-8") as f:
+                                f.write(after_ncu)
+            except Exception:
+                pass
 
         if round_dir:
             with open(os.path.join(round_dir, "best.json"), "w", encoding="utf-8") as f:
@@ -724,6 +929,7 @@ def main():
                 "best_child": best_child,
                 "best_speedup_so_far": best_speedup_so_far,
                 "accept": accept,
+                "significant_improvement": significant_improvement,
                 "next_base_impl": base_impl,
             }
         )
