@@ -25,12 +25,14 @@ from geak_eval.evaluators.interface import TestAllCloseEvaluatorTBG
 
 
 REF_OP_PATH = r"/workspace/zibo/Geak-OPT/GEAK-eval/geak_eval/data/TritonBench/data/TritonBench_G_v1/dequantize_rowwise.py"
-NUM_ROUNDS = 10
-OFFSPRING_PER_ROUND = 5
+NUM_ROUNDS = 5
+OFFSPRING_PER_ROUND = 10
+TUNE_NUMS_PER_BOTTLENECK = 2
+OFFSPRING_REPEAT_PER_PLAN = 2
 
 ATOL = 1e-3
 RTOL = 1e-3
-TIMEOUT_S = 2 * 60
+TIMEOUT_S = 5 * 60
 
 OUTPUT_ROOT = r"/workspace/zibo/Geak-OPT/WIse-Agent/output"
 REPORT_PREFIX = "optimize"
@@ -58,7 +60,51 @@ def _run(cmd, cwd=None, env=None):
     return p.returncode, p.stdout, p.stderr
 
 
-def _qwen_chat(messages: list[dict]) -> str:
+def _extract_json_array(text: str) -> list | None:
+    if not text:
+        return None
+
+    m = re.search(r"```json\s*(\[.*?\])\s*```", text, flags=re.S | re.I)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    start = text.find("[")
+    if start < 0:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                cand = text[start : i + 1]
+                try:
+                    return json.loads(cand)
+                except Exception:
+                    pass
+
+    return None
+
+
+def _get_plan_priority(plan) -> int | None:
+    if not isinstance(plan, dict):
+        return None
+    p = plan.get("priority")
+    if p is None:
+        return None
+    try:
+        return int(p)
+    except Exception:
+        return None
+
+
+def _qwen_chat(messages: list[dict], temperature: float = 0.7) -> str:
     from openai import OpenAI
 
     api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -67,13 +113,14 @@ def _qwen_chat(messages: list[dict]) -> str:
 
     client = OpenAI(
         api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
 
     completion = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
         stream=True,
+        temperature=temperature,  # 添加温度参数
     )
     out = []
     for chunk in completion:
@@ -161,81 +208,80 @@ def _analyze_bottleneck(table: str) -> dict:
     return strategy
 
 
-def _draft_prompts(op_name: str, table: str, strategy: str) -> tuple[str, str]:
-    p1 = f"""你是 Nsight Compute (ncu) 性能分析专家，熟悉 NVIDIA Ampere（如 RTX 3090）微架构以及 Triton kernel 的实现与调优（block/tile size、program_id 映射、访存模式、num_warps、num_stages、pipeline、ILP、latency hiding 等）。
+def _draft_step1_prompt(kernel_code: str, ncu_res: str, tune_nums4each_bottleneck: int) -> str:
+    return f"""你是一个Nsight Compute (ncu) 性能分析专家，熟悉NVIDIA Ampere微架构以及Triton kernel实现与调优。
+以下profiling 结果来自Triton生成的单个GPU kernel在真实GPU上的执行，所有指标具有事实约束。
 
-以下 profiling 结果来自 Triton 生成的单个 GPU kernel 在真实 GPU 上的执行，所有指标具有事实约束。
-
-【严格前提约束（必须遵守）】
-- 输入数据固定：shape / batch / problem size 不变
-- 算子语义固定：数学语义不可改变
-- 一次只分析一个 kernel
-- 禁止宏观调优：
-  - 算子融合/拆分、pipeline 调整
-  - 改变输入规模、数值精度或算法语义
-
-你给出的优化建议必须仅限 Triton kernel 实现层面，且必须能直接映射到代码修改点，允许的杠杆包括且仅包括：
-- block / tile size（如 BLOCK_M/N/K 等）
-- program_id 映射（pid 与 M/N 维度映射、swizzle）
-- memory access pattern（coalescing / reuse / stride / vectorized load/store）
-- L1 / L2 / shared memory 行为
-- num_warps / num_stages / software pipeline
-- latency hiding、warp divergence、serialization
+【输入信息】
+硬件信息：GPU：Ampere RTX 3090，82 SM; Warp Size：32; 每SM：128 CUDA Cores
+当前Triton kernel实现: {kernel_code}
+ncu profile关键指标结果: {ncu_res}
 
 【任务要求】
-结合下面这张 ncu 表格（仅此表），判断该 Triton kernel 当前实现的主导性能瓶颈类型：
-Memory-bound / Latency-bound / Instruction-bound / Occupancy-limited / Serialization-bound 等。
+1. 基于上述Kernel实现和对应的ncu profile结果，分析当前单个Kernel实现的性能瓶颈。
+\t- Kernel输入数据固定（shape/problem size固定不变）情况下的，Kernel实现的瓶颈
+\t- 忽略任何从宏观角度的瓶颈分析与调优，包括输入规模、模型或pipeline调整、算子融合
+2. 基于每个Kernel实现的瓶颈（注：输入固定），为当前Triton kernel给出{int(tune_nums4each_bottleneck)}种不同的kernel调优建议：
+\t- 每个调优方案必须直接且唯一地针对该Kernel实现的瓶颈，忽略其他因素导致的瓶颈
+\t- 优化建议仅限Triton kernel实现层面，包括且仅包括：block/tile size, program_id映射, memory access pattern（coalescing/reuse/stride）, L1/L2/shared memory行为, num_warps/num_stages, latency hiding, warp divergence, serialization
+\t- 每个调优方案按"预期收益"×"实施复杂度"的综合优先级排序，其中，收益更大、修改更简单的调优plan优先级更高
 
-你必须：
-1) 明确指出对应的 ncu 指标（来自表格中 Metric Name/Value），并给出因果链：指标 -> 微架构行为 -> 性能受限。
-2) 仅分析可通过 Triton kernel 实现修改解决的瓶颈（禁止归因于不可变硬件或理论峰值）。
-3) 给出 ONE 条具体可执行的优化策略句子，必须点名可修改的 Triton 代码层杠杆（例如 num_warps/num_stages、tl.multiple_of、tl.max_contiguous、向量化 load/store、tile/block 大小、pid 映射）。
+【重要约束（必须遵守）】
+- 你必须输出至少 2 个不同的 bottleneck。
+- 对于每一个 bottleneck，你必须输出恰好 {int(tune_nums4each_bottleneck)} 条不同的 triton_tuning_plan（也就是数组中会出现同名 bottleneck 的多条元素）。
+- priority 必须为从 1 开始的连续整数，并严格按 priority 从小到大排序输出。
 
-【严格输出格式（必须完全遵守）】
-当前 Triton kernel 的核心实现瓶颈在于 XXX-bound。
-Evidence 包括：
-ncu 指标 A 显示 ……
-ncu 指标 B 表明 ……
-这些指标反映 ……，因此性能主要受限于 ……
-Optimization: <两到三条短句，必须是可直接映射到 Triton 代码修改的策略>
-
-【ncu 表格】
-{table}
+【严格输出格式】
+- 仅输出一个 JSON 数组，每个元素对应一个瓶颈及其调优方案：
+- 不得输出解释、分析、注释说明或任何无关内容
+- 允许多个元素的 bottleneck 相同，但 triton_tuning_plan 必须不同（对应同一瓶颈的多个方案）
+- 必须按 priority 从小到大排序输出（priority 越小优先级越高）
+输入形式如下：
+[
+  {{
+    "priority": 1,
+    "bottleneck": "...",
+    "metric_evidence": "Explicitly list the supporting ncu metrics and explain their implications",
+    "triton_tuning_plan": "Describe concrete Triton kernel code-level modifications"
+  }},
+  {{
+    "priority": 2,
+    "bottleneck": "...",
+    "metric_evidence": "...",
+    "triton_tuning_plan": "..."
+  }},
+    {{
+    "priority": 3,
+    "bottleneck": "...",
+    "metric_evidence": "...",
+    "triton_tuning_plan": "..."
+  }},
+  ......
+]
 """
 
-    p2 = f"""你是一个资深 Triton kernel 优化工程师，目标是在 NVIDIA GPU（CUDA）上优化 Triton 算子实现。
 
-你将收到：
-- 来自 step1 的优化策略（包含 2-3 条短句，带明确的调参/代码杠杆）
-- 当前算子实现代码（仅包含实现，不含测试）
+def _draft_step2_prompt(kernel_code: str, triton_tuning_plan: str) -> str:
+    return f"""你是一个经验丰富的 Triton kernel 编程专家。
+请严格依据给定的 revision plan，对现有 Triton kernel 代码进行修改。
+【Triton kernel实现】
+{kernel_code}
 
-你的任务：
-- 严格落实下方“优化策略”，对当前实现进行改写，以提升单 kernel 性能。
+【Triton调优计划】
+{triton_tuning_plan}
 
-【优化策略（必须遵循并落实到代码改动）】
-{strategy}
+【强制约束】
+- 不得修改kernel的输入/输出接口与调用方式
+- 不得改变kernel的语义（任何合法输入下，输出结果必须与原本实现完全相同）
+- 不得引入任何Triton中不存在或未公开的APIs
 
-【硬性约束（必须遵守）】
-1) 语义不变：数学语义、输出必须保持一致。
-2) 接口不变：函数名、函数签名、输入输出类型保持一致。
-3) 不允许宏观改动：禁止算子融合/拆分、禁止改变输入规模、禁止改变数值精度或算法语义。
-4) 一次只针对一个 kernel 的实现做优化。
+- 除 revision plan 明确要求外
+- Triton版本: Triton版本3.0.0 or later.
 
-【允许的优化手段（仅限 Triton 实现层面）】
-- block/tile size 调整（BLOCK_*、num_warps、num_stages）
-- program_id 映射/线程块映射（pid -> (m,n) 的映射、swizzle、分块方式）
-- 访存模式优化：coalescing、减少 stride、提高 reuse、向量化 load/store（例如把标量改为 tl.load/tl.store 的更大连续块）
-- 使用 tl.multiple_of / tl.max_contiguous 传递对齐与连续性信息
-- 合理使用 software pipeline / latency hiding（num_stages、ILP），降低 divergence/serialization
-- 合理使用 shared memory / L1/L2 行为（仅在不改变语义前提下）
-
-【输出要求（必须严格遵守）】
-- 只输出修改后的完整 Python 代码，且必须放在一个 ```python 代码块``` 中。
-- 不要输出解释、不要输出分析文字、不要输出多余的 Markdown。
-- 如果你需要新增/修改 autotune config（如 triton.autotune / num_warps 候选），可以做，但必须保持接口不变。
+【输出要求】
+- 仅输出修改后的完整 Triton kernel 代码
+- 不得输出解释、分析、注释说明或任何无关内容
 """
-
-    return p1, p2
 
 
 def _write_ncu_runner(runner_path: str):
@@ -435,28 +481,45 @@ def main():
 
         analysis = _analyze_bottleneck(table)
 
-        prompt1, _ = _draft_prompts(op_name, table, analysis["optimization_strategy"])
-
         src = _read_operator_impl(base_impl)
 
-        step1_prompt_full = prompt1 + "\n\nCurrent operator implementation:\n```python\n" + src + "```\n"
+        step1_prompt_full = _draft_step1_prompt(src, table, int(TUNE_NUMS_PER_BOTTLENECK))
         step1_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": step1_prompt_full},
         ]
-        strategy_text = _qwen_chat(step1_messages).strip()
-        strategy_text = re.sub(r"```.*?```", "", strategy_text, flags=re.S)
-        strategy_text = strategy_text.strip()
+        step1_raw = _qwen_chat(step1_messages).strip()
+        plans = _extract_json_array(step1_raw)
+        if not isinstance(plans, list):
+            plans = []
+
+        plans_sorted = list(plans)
+        plans_sorted.sort(key=lambda x: (_get_plan_priority(x) is None, _get_plan_priority(x) if _get_plan_priority(x) is not None else 10**9))
+
+        step1_strategy_text = step1_raw
 
         if round_dir:
             with open(os.path.join(round_dir, "step1_prompt.txt"), "w", encoding="utf-8") as f:
                 f.write(step1_prompt_full)
             with open(os.path.join(round_dir, "step1_strategy.txt"), "w", encoding="utf-8") as f:
-                f.write(strategy_text)
+                f.write(step1_strategy_text)
+            with open(os.path.join(round_dir, "step1_plans.json"), "w", encoding="utf-8") as f:
+                json.dump(plans_sorted, f, ensure_ascii=False, indent=2)
+
+        repeat = int(OFFSPRING_REPEAT_PER_PLAN)
+        if repeat <= 0:
+            repeat = 1
+
+        tasks = []
+        for plan_idx, plan in enumerate(plans_sorted):
+            for rep_idx in range(1, repeat + 1):
+                tasks.append({"plan_index": plan_idx, "repeat_index": rep_idx, "plan": plan})
 
         k = int(OFFSPRING_PER_ROUND)
         if k <= 0:
             k = 1
+        if tasks:
+            k = min(k, len(tasks))
 
         best_child = None
         best_child_speedup = float("-inf")
@@ -466,9 +529,13 @@ def main():
             if round_dir:
                 os.makedirs(child_dir, exist_ok=True)
 
-            _, prompt2 = _draft_prompts(op_name, table, strategy_text)
-
-            step2_prompt_full = prompt2 + "\n\nCurrent operator implementation:\n```python\n" + src + "```\n"
+            task = tasks[child_i - 1] if tasks and len(tasks) >= child_i else {"plan": {}}
+            plan = task.get("plan")
+            plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
+            plan_priority = _get_plan_priority(plan)
+            plan_index = task.get("plan_index")
+            repeat_index = task.get("repeat_index")
+            step2_prompt_full = _draft_step2_prompt(src, plan_text)
             step2_messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": step2_prompt_full},
@@ -488,6 +555,10 @@ def main():
             if round_dir:
                 with open(os.path.join(child_dir, "step2_prompt.txt"), "w", encoding="utf-8") as f:
                     f.write(step2_prompt_full)
+                with open(os.path.join(child_dir, "plan.json"), "w", encoding="utf-8") as f:
+                    f.write(plan_text)
+                with open(os.path.join(child_dir, "task.json"), "w", encoding="utf-8") as f:
+                    json.dump(task, f, ensure_ascii=False, indent=2)
 
             eval_res = _evaluate_candidate(candidate_path, ref_op)
             runnable_ok = bool(eval_res.get("compile_ok"))
@@ -508,7 +579,10 @@ def main():
             child_info = {
                 "child": child_i,
                 "candidate": candidate_path,
-                "strategy": strategy_text,
+                "plan": plan,
+                "priority": plan_priority,
+                "plan_index": plan_index,
+                "repeat_index": repeat_index,
                 "eval": eval_res,
                 "runnable_ok": runnable_ok,
                 "correct_ok": correct_ok,
@@ -533,7 +607,10 @@ def main():
                     {
                         "round": r,
                         "base_speedup_so_far": best_speedup_so_far,
-                        "strategy": strategy_text,
+                        "step1_raw": step1_raw,
+                        "plans": plans_sorted,
+                        "offspring_repeat_per_plan": repeat,
+                        "tasks": tasks,
                         "best_child": best_child,
                         "children": children,
                         "accept": accept,
@@ -547,8 +624,9 @@ def main():
         round_info.update(
             {
                 "analysis": analysis,
-                "prompt_step1": prompt1,
-                "strategy": strategy_text,
+                "step1_raw": step1_raw,
+                "plans": plans_sorted,
+                "offspring_repeat_per_plan": repeat,
                 "children": children,
                 "best_child": best_child,
                 "best_speedup_so_far": best_speedup_so_far,
