@@ -36,7 +36,7 @@ ATOL = 1e-3
 RTOL = 1e-3
 TIMEOUT_S = 5 * 60
 
-OUTPUT_ROOT = r"/workspace/zibo/Geak-OPT/WIse-Agent/output"
+OUTPUT_ROOT = r"/workspace/zibo/Geak-OPT/WIse-Agent/output/1.20/kldiv_compute"
 REPORT_PREFIX = "optimize"
 NCU_SET = "full"
 NCU_FULL_REPORT = 0
@@ -136,8 +136,8 @@ def _draft_experience_prompt(strategy: str, before_impl: str, after_impl: str, b
 【任务】
 请提炼一段可复用的“优化经验”，要求包含：
 1) 改动内容：用可迁移的语言总结（例如：block/tile 调整、num_warps/num_stages、pid 映射、访存对齐/连续性提示等），点出 before->after 的关键变化。
-2) 改动后效果：用“预期带来的性能变化原因”来解释（例如提高并行度/占用率、改善 coalescing、减少冗余 load 等），不要杜撰具体数值。
-3) 适用条件与注意事项：说明在什么输入规模/访存模式下可能有效，哪些情况下可能无效或引入风险。
+2) 改动后效果：基于ncu profiling结果，分析哪些关键指标得到了明显提升。
+3) 后续建议：给出明确的优化建议或经验（仍限定在 Triton kernel 实现层面）。
 
 【输出要求】
 - 仅输出一段纯文本（100~250 字），不要输出列表，不要输出 JSON，不要输出 Markdown。
@@ -166,7 +166,7 @@ def _draft_lesson_prompt(strategy: str, before_impl: str, after_impl: str, befor
 【任务】
 请提炼一段可复用的“优化教训”，要求包含：
 1) 改动内容：概括 before->after 的关键变化。
-2) 负收益/退化的可能原因：结合 profiling 变化，从并行度、occupancy、访存模式、额外开销、divergence、serialization 等角度分析。
+2) 改动后效果：基于ncu profiling结果，分析哪些关键指标明显变差。
 3) 后续建议：给出明确的规避建议或替代方向（仍限定在 Triton kernel 实现层面）。
 
 【输出要求】
@@ -358,6 +358,8 @@ def _draft_step1_prompt(kernel_code: str, ncu_res: str, tune_nums4each_bottlenec
     return f"""你是一个Nsight Compute (ncu) 性能分析专家，熟悉NVIDIA Ampere微架构以及Triton kernel实现与调优。
 以下profiling 结果来自Triton生成的单个GPU kernel在真实GPU上的执行，所有指标具有事实约束。
 
+请充分参考在本提示词前面提供的【历史优化经验】与【历史优化教训】，优先复用已验证有效的思路，并避免重复踩坑；但不得违反本提示词中的任何硬性约束。
+
 【输入信息】
 硬件信息：GPU：Ampere RTX 3090，82 SM; Warp Size：32; 每SM：128 CUDA Cores
 当前Triton kernel实现: {kernel_code}
@@ -367,14 +369,13 @@ ncu profile关键指标结果: {ncu_res}
 1. 基于上述Kernel实现和对应的ncu profile结果，分析当前单个Kernel实现的性能瓶颈。
 \t- Kernel输入数据固定（shape/problem size固定不变）情况下的，Kernel实现的瓶颈
 \t- 忽略任何从宏观角度的瓶颈分析与调优，包括输入规模、模型或pipeline调整、算子融合
-2. 基于每个Kernel实现的瓶颈（注：输入固定），为当前Triton kernel给出{int(tune_nums4each_bottleneck)}种不同的kernel调优建议：
+2. 基于每个Kernel实现的瓶颈（注：输入固定），为当前Triton kernel给出kernel调优建议：
 \t- 每个调优方案必须直接且唯一地针对该Kernel实现的瓶颈，忽略其他因素导致的瓶颈
 \t- 优化建议仅限Triton kernel实现层面，包括且仅包括：block/tile size, program_id映射, memory access pattern（coalescing/reuse/stride）, L1/L2/shared memory行为, num_warps/num_stages, latency hiding, warp divergence, serialization
 \t- 每个调优方案按"预期收益"×"实施复杂度"的综合优先级排序，其中，收益更大、修改更简单的调优plan优先级更高
 
 【重要约束（必须遵守）】
 - 你必须输出至少 2 个不同的 bottleneck。
-- 对于每一个 bottleneck，你必须输出恰好 {int(tune_nums4each_bottleneck)} 条不同的 triton_tuning_plan（也就是数组中会出现同名 bottleneck 的多条元素）。
 - priority 必须为从 1 开始的连续整数，并严格按 priority 从小到大排序输出。
 
 【严格输出格式】
@@ -437,7 +438,18 @@ def _write_ncu_runner(runner_path: str):
         f.write("import sys\n")
         f.write("\n")
         f.write("this_dir = os.path.dirname(os.path.abspath(__file__))\n")
-        f.write("repo_root = os.path.abspath(os.path.join(this_dir, '..', '..'))\n")
+        f.write("repo_root = None\n")
+        f.write("cur = this_dir\n")
+        f.write("for _ in range(12):\n")
+        f.write("    if os.path.isdir(os.path.join(cur, 'GEAK-eval')):\n")
+        f.write("        repo_root = cur\n")
+        f.write("        break\n")
+        f.write("    parent = os.path.dirname(cur)\n")
+        f.write("    if parent == cur:\n")
+        f.write("        break\n")
+        f.write("    cur = parent\n")
+        f.write("if repo_root is None:\n")
+        f.write("    repo_root = os.path.abspath(os.path.join(this_dir, '..', '..'))\n")
         f.write("geak_eval_root = os.path.join(repo_root, 'GEAK-eval')\n")
         f.write("if repo_root not in sys.path:\n")
         f.write("    sys.path.insert(0, repo_root)\n")
