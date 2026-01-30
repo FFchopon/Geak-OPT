@@ -611,7 +611,7 @@ def main():
         except Exception:
             best_solution_profiling = None
         # Seed perf_candidates with the dataset implementation.
-        seed = (base_src, best_solution_speedup, 0.0, "", best_solution_profiling)
+        seed = (base_src, 1.0, 0.0, "", best_solution_profiling)
         perf_candidates.append(seed)
         perf_candidates.sort(key=lambda x: x[1], reverse=True)
 
@@ -630,7 +630,12 @@ def main():
         text = prompt_for_generation.prompt.format(
             instruction=instruction,
             function_signatures=fss_text,
-            reference_section="",
+            reference_section=(
+                "**Reference Implementation (from dataset, speedup=1.0 baseline):**\n"
+                "```python\n"
+                + (base_src or "")
+                + "\n```"
+            ),
         )
 
         # Optimization mode prompt: keep exactly consistent with GaAgent.generate_solution.
@@ -712,7 +717,7 @@ def main():
                 except Exception:
                     rc.profilig = None
 
-            # Perf pass criteria matches GaAgent: speedup>0 and correctness.
+            # Perf-valid criteria for rewrite control: speedup>0 and correctness.
             rc.pass_perf = bool(rc.pass_exe and (rc.latency > 0.0))
 
             with open(os.path.join(child_dir, "eval.json"), "w", encoding="utf-8") as f:
@@ -759,7 +764,8 @@ def main():
             if len(history[i]) > 5:
                 history[i] = history[i][-5:]
 
-            if rc.pass_perf:
+            # perf_candidates admission is stricter than pass_perf: only speedup>1.0
+            if round_pass_exe and rc.pass_exe and (float(rc.latency or 0.0) > 1.0):
                 cand = (rc.code, float(rc.latency), 0.0, rc.reflections, rc.profilig)
                 if len(perf_candidates) < ancestor_num:
                     perf_candidates.append(cand)

@@ -1,0 +1,5 @@
+- ncu_llm文件夹下主要是添加了对ncu信息的分析和提炼
+    - profile.py 获取算子运行的profile信息（截取首个算子）
+    - parse.py 解析profile信息，将信息嵌入提示词
+    - optimize.py 总优化脚本（5瓶颈）
+    - optimize_s.py 总优化脚本（3瓶颈）
